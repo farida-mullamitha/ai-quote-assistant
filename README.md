@@ -61,27 +61,3 @@ price lists --load_price_lists.py--+--> one catalogue table (6,366 rows)
 | `src/match_missing_codes.py` | Spec-based candidates for lines without a code (air circuit breakers only) |
 | `src/generate_quotation.py` | Fills the template; adds rows beyond 17 lines |
 | `tests/test_kestrel_rfq.py` | Golden test for the Kestrel RFQ (26 checks) |
-
-## Known limits
-
-- RFQs must contain a table. Scanned PDFs (need OCR) and RFQs written as
-  email text (need AI extraction) are not supported yet.
-- Candidate matching only handles air circuit breakers, and its scoring
-  weights have only been tuned on two RFQ lines.
-- "MATCHED - VERIFY SPECS" means the part code exists. It does not yet compare
-  the catalogue specs with the RFQ description.
-- `breaking_capacity` is a class letter for ABB (for example N) and kA for
-  Schneider. Do not compare them directly.
-- Prices are INR list price (MRP), before any discount. The template is INR with
-  18% GST, but the Kestrel RFQ asks for GBP: the draft banner says so.
-- The tests check exact prices from the current price lists. If the price lists
-  are updated, expect those tests to need new expected values.
-
-## Questions still open for the senior
-
-1. How is the selling price calculated from the list price (discount, margin,
-   freight, packing)?
-2. Currency, exchange-rate source and tax treatment for UK customers.
-3. Numbering rule for the quote reference (currently `DRAFT-01`).
-4. What does ABB's "MDO" mean in the Formula Air descriptions?
-5. A finished quote for the Kestrel RFQ, to use as the expected answer.
