@@ -2,8 +2,8 @@ import re
 
 import pandas as pd
 
-from extract_rfq import extract_rfq_lines
-from load_price_lists import load_catalogue
+from src.extract_rfq import extract_rfq_lines
+from src.load_price_lists import load_catalogue
 
 
 # Specifications we can look for in a product description.
@@ -156,14 +156,15 @@ def score_candidate(rfq_description, make, row):
     return score, reasons, conflicts
 
 
-def main():
-    rfq_path = "data/raw/RFQ_KBS-0147.pdf"
-    rfq_lines = extract_rfq_lines(rfq_path)
-    catalogue = load_catalogue()
 
-    # Support either a DataFrame or a list of dictionaries.
+def find_missing_code_candidates(rfq_lines, catalogue=None):
+    """Return ranked catalogue candidates for RFQ lines with missing codes."""
+
     if isinstance(rfq_lines, pd.DataFrame):
         rfq_lines = rfq_lines.to_dict("records")
+
+    if catalogue is None:
+        catalogue = load_catalogue()
 
     if isinstance(catalogue, pd.DataFrame):
         catalogue_rows = catalogue.to_dict("records")
@@ -175,33 +176,26 @@ def main():
         if not str(line.get("part_code", "") or "").strip()
     ]
 
-    if not missing_lines:
-        print("No RFQ lines with missing part codes were found.")
-        return
+    report = []
 
     for line in missing_lines:
         description = str(line.get("description", "") or "")
         make = str(line.get("make", "") or "")
         line_no = line.get("line_no", "?")
 
-        print("\n" + "=" * 70)
-        print(f"RFQ line {line_no}: {description}")
-        print(f"Requested make: {make or 'Not specified'}")
-        print("Extracted specifications:", extract_specs(description))
+        # This prototype currently supports air circuit breakers only.
+        if "AIR CIRCUIT BREAKER" not in description.upper():
+            continue
 
         results = []
 
         for row in catalogue_rows:
-            # Do not rank products from a different manufacturer.
             supplier = str(row.get("supplier", "") or "").upper()
+
             if make and make.upper() not in supplier:
                 continue
 
             candidate_text = get_text(row)
-
-            # Keep this first prototype focused on air circuit breakers.
-            if "AIR CIRCUIT BREAKER" not in description.upper():
-                continue
 
             if (
                 "AIR CIRCUIT BREAKER" not in candidate_text
@@ -218,24 +212,61 @@ def main():
         results.sort(key=lambda item: item[0], reverse=True)
 
         if not results:
-            print("No air circuit breaker candidates found in the catalogue.")
+            report.append({
+                "line_no": line_no,
+                "rfq_description": description,
+                "requested_make": make,
+                "rank": None,
+                "score": None,
+                "part_code": "",
+                "candidate_description": "",
+                "price": "",
+                "supporting_details": "",
+                "checks_needed": "No candidates found in catalogue",
+                "decision": "HUMAN REVIEW REQUIRED",
+            })
             continue
-
-        print("\nTop candidates (all require human verification):")
 
         for rank, (score, reasons, conflicts, row) in enumerate(
             results[:5], start=1
         ):
-            print(f"\n{rank}. Score: {score}")
-            print("   Part code:", row.get("part_code", "Not listed"))
-            print("   Description:", row.get("description", ""))
-            print("   Sheet/category:", row.get("source_sheet", row.get("category", "")))
-            print("   Price:", row.get("price_inr", row.get("price_status", "Unknown")))
-            print("   Supporting details:", "; ".join(reasons) or "None found")
-            print("   Checks needed:", "; ".join(conflicts) or "Verify full specifications")
+            report.append({
+                "line_no": line_no,
+                "rfq_description": description,
+                "requested_make": make,
+                "rank": rank,
+                "score": score,
+                "part_code": row.get("part_code", ""),
+                "candidate_description": row.get("description", ""),
+                "source_sheet": row.get(
+                    "source_sheet", row.get("category", "")
+                ),
+                "price": row.get(
+                    "price_inr", row.get("price_status", "Unknown")
+                ),
+                "supporting_details": "; ".join(reasons),
+                "checks_needed": "; ".join(conflicts)
+                or "Verify full specifications",
+                "decision": "HUMAN REVIEW REQUIRED",
+            })
 
-        print("\nDecision: HUMAN REVIEW REQUIRED — no code selected automatically.")
+    return report
+
+
+def main():
+    rfq_path = "data/raw/RFQ_KBS-0147.pdf"
+    rfq_lines = extract_rfq_lines(rfq_path)
+
+    candidates = find_missing_code_candidates(rfq_lines)
+
+    if not candidates:
+        print("No candidates found for missing-code RFQ lines.")
+        return
+
+    for candidate in candidates:
+        print(candidate)
 
 
 if __name__ == "__main__":
     main()
+
