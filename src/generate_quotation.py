@@ -1,9 +1,13 @@
-
 from copy import copy
 from pathlib import Path
 
+import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 from openpyxl.utils.cell import range_boundaries
+
+from src.extract_rfq import extract_rfq_lines
+from src.load_price_lists import load_catalogue, add_supplier_prices
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -13,14 +17,39 @@ RFQ_PATH = PROJECT_ROOT / "data" / "raw" / "RFQ_KBS-0147.pdf"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
 
 FIRST_ITEM_ROW = 13
-LAST_TEMPLATE_ITEM_ROW = 29
+LAST_ITEM_ROW = 29
+
+# Template column positions
+COL_NUMBER = 1
+COL_PART_CODE = 2
+COL_DESCRIPTION = 3
+COL_UNIT = 9
+COL_QUANTITY = 10
+COL_UNIT_PRICE = 11
+COL_LINE_TOTAL = 13
 
 
-def copy_row_format(ws, source_row, target_row):
-    """Copy cell formatting and row height to a new item row."""
-    for col in range(1, ws.max_column + 1):
-        source = ws.cell(source_row, col)
-        target = ws.cell(target_row, col)
+def get_value(item, *column_names, default=None):
+    """Return the first available, non-empty value from an RFQ item."""
+    for name in column_names:
+        if name in item.index:
+            value = item[name]
+
+            if value is not None and not pd.isna(value):
+                if str(value).strip():
+                    return value
+
+    return default
+
+
+def copy_row_format(sheet, source_row, target_row):
+    """Copy formatting and row height without copying cell values."""
+    for column in range(1, sheet.max_column + 1):
+        source = sheet.cell(source_row, column)
+        target = sheet.cell(target_row, column)
+
+        if isinstance(source, MergedCell):
+            continue
 
         if source.has_style:
             target._style = copy(source._style)
@@ -34,123 +63,155 @@ def copy_row_format(ws, source_row, target_row):
         if source.protection:
             target.protection = copy(source.protection)
 
-    height = ws.row_dimensions[source_row].height
-    if height is not None:
-        ws.row_dimensions[target_row].height = height
+    source_height = sheet.row_dimensions[source_row].height
+    if source_height is not None:
+        sheet.row_dimensions[target_row].height = source_height
 
 
-def expand_item_table(ws, item_count):
-    """Insert item rows and correctly restore merged cells below the table."""
-    capacity = LAST_TEMPLATE_ITEM_ROW - FIRST_ITEM_ROW + 1
+def expand_item_table(sheet, item_count):
+    """Expand the item table while preserving existing merged cells."""
+    current_capacity = LAST_ITEM_ROW - FIRST_ITEM_ROW + 1
+    extra_rows = item_count - current_capacity
 
-    if item_count <= capacity:
-        return None
+    if extra_rows <= 0:
+        return
 
-    extra_rows = item_count - capacity
-    insert_at = LAST_TEMPLATE_ITEM_ROW + 1
+    insert_at = LAST_ITEM_ROW + 1
 
-    # Save and temporarily remove merges that could be affected by insertion.
-    affected_merges = [
+    # Save and temporarily remove merged ranges below the item table.
+    affected_ranges = [
         str(merged_range)
-        for merged_range in list(ws.merged_cells.ranges)
+        for merged_range in list(sheet.merged_cells.ranges)
         if merged_range.max_row >= insert_at
     ]
 
-    for merged_range in affected_merges:
-        ws.unmerge_cells(merged_range)
+    for merged_range in affected_ranges:
+        sheet.unmerge_cells(merged_range)
 
-    # openpyxl does not automatically move row heights when inserting rows.
-    saved_heights = {
-        row: ws.row_dimensions[row].height
-        for row in list(ws.row_dimensions)
-        if row >= insert_at
-    }
+    # Insert rows for additional RFQ items.
+    sheet.insert_rows(insert_at, extra_rows)
 
-    for row in saved_heights:
-        del ws.row_dimensions[row]
-
-    ws.insert_rows(insert_at, extra_rows)
-
-    # Restore row heights at their new positions.
-    for row, height in saved_heights.items():
-        if height is not None:
-            ws.row_dimensions[row + extra_rows].height = height
-
-    # Format the additional item rows using the final template item row.
-    for row in range(insert_at, insert_at + extra_rows):
-        copy_row_format(ws, LAST_TEMPLATE_ITEM_ROW, row)
-
-    # Restore the original merged cells at their shifted positions.
-    for merged_range in affected_merges:
+    # Restore existing merged ranges at their new row positions.
+    for merged_range in affected_ranges:
         min_col, min_row, max_col, max_row = range_boundaries(
             merged_range
         )
 
         if min_row >= insert_at:
             min_row += extra_rows
-            max_row += extra_rows
-        elif max_row >= insert_at:
+
+        if max_row >= insert_at:
             max_row += extra_rows
 
-        ws.merge_cells(
+        sheet.merge_cells(
             start_row=min_row,
             start_column=min_col,
             end_row=max_row,
             end_column=max_col,
         )
 
-    # Create the usual item-row merges for each additional row.
+    # Create rows matching the original item-row layout.
     for row in range(insert_at, insert_at + extra_rows):
-        for start_col, end_col in [
-            (3, 8),    # C:H — Description
-            (11, 12),  # K:L — Unit rate
-            (13, 14),  # M:N — Line total
-        ]:
-            ws.merge_cells(
-                start_row=row,
-                start_column=start_col,
-                end_row=row,
-                end_column=end_col,
-            )
+        copy_row_format(sheet, LAST_ITEM_ROW, row)
 
-    last_item_row = FIRST_ITEM_ROW + item_count - 1
-    subtotal_row = last_item_row + 1
-    tax_row = subtotal_row + 1
-    packing_row = subtotal_row + 2
-    freight_row = subtotal_row + 3
-    inspection_row = subtotal_row + 4
-    total_row = subtotal_row + 5
-
-    return {
-        "last_item_row": last_item_row,
-        "subtotal_row": subtotal_row,
-        "tax_row": tax_row,
-        "packing_row": packing_row,
-        "freight_row": freight_row,
-        "inspection_row": inspection_row,
-        "total_row": total_row,
-    }
-
-
-def generate_quotation(rfq_path=RFQ_PATH, output_path=None, rfq_df=None):
-    """Create a draft Excel quotation from an RFQ and the IEPCI template."""
-    from src.extract_rfq import extract_rfq_lines
-
-    if rfq_df is None:
-        rfq_df = extract_rfq_lines(str(rfq_path))
-
-    if rfq_df.empty:
-        raise ValueError("The RFQ contains no extracted line items.")
-
-    if len(rfq_df) > 100:
-        raise ValueError(
-            "This RFQ has more than 100 items; review it before generating."
+        # Description, unit price and line total use merged cells.
+        sheet.merge_cells(
+            start_row=row, start_column=3,
+            end_row=row, end_column=8
         )
+        sheet.merge_cells(
+            start_row=row, start_column=11,
+            end_row=row, end_column=12
+        )
+        sheet.merge_cells(
+            start_row=row, start_column=13,
+            end_row=row, end_column=14
+        )
+
+
+def set_cell_value(sheet, row, column, value):
+    """Write only to the top-left cell of a merged range."""
+    cell = sheet.cell(row, column)
+
+    if isinstance(cell, MergedCell):
+        for merged_range in sheet.merged_cells.ranges:
+            if (
+                merged_range.min_row <= row <= merged_range.max_row
+                and merged_range.min_col <= column <= merged_range.max_col
+            ):
+                cell = sheet.cell(
+                    merged_range.min_row,
+                    merged_range.min_col,
+                )
+                break
+
+    cell.value = value
+
+
+def find_label_row(sheet, keywords):
+    """Find a totals row by searching its visible labels."""
+    for row in range(1, sheet.max_row + 1):
+        row_text = " ".join(
+            str(sheet.cell(row, column).value or "").lower()
+            for column in range(1, 13)
+        )
+
+        if any(keyword in row_text for keyword in keywords):
+            return row
+
+    return None
+
+
+def update_totals(sheet, first_item_row, last_item_row):
+    """Update totals formulas when the corresponding labels are found."""
+    subtotal_row = find_label_row(sheet, ["subtotal", "sub total"])
+    tax_row = find_label_row(sheet, ["gst", "vat"])
+    grand_total_row = find_label_row(
+        sheet, ["grand total", "total payable", "net total"]
+    )
+
+    if subtotal_row is not None:
+        set_cell_value(
+            sheet,
+            subtotal_row,
+            COL_LINE_TOTAL,
+            f"=SUM(M{first_item_row}:M{last_item_row})",
+        )
+
+    if tax_row is not None and subtotal_row is not None:
+        # Retain the template's existing 18% tax assumption for review.
+        set_cell_value(
+            sheet,
+            tax_row,
+            COL_LINE_TOTAL,
+            f"=M{subtotal_row}*18%",
+        )
+
+    if grand_total_row is not None and subtotal_row is not None:
+        if tax_row is not None:
+            formula = f"=M{subtotal_row}+M{tax_row}"
+        else:
+            formula = f"=M{subtotal_row}"
+
+        set_cell_value(
+            sheet,
+            grand_total_row,
+            COL_LINE_TOTAL,
+            formula,
+        )
+
+
+def generate_quotation(rfq_path=RFQ_PATH, output_path=None):
+    """Create a draft Excel quotation from RFQ and supplier price data."""
+    rfq_path = Path(rfq_path)
 
     if not TEMPLATE_PATH.exists():
         raise FileNotFoundError(
             f"Quotation template not found: {TEMPLATE_PATH}"
         )
+
+    if not rfq_path.exists():
+        raise FileNotFoundError(f"RFQ not found: {rfq_path}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -160,128 +221,116 @@ def generate_quotation(rfq_path=RFQ_PATH, output_path=None, rfq_df=None):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 1. Extract all RFQ items.
+    rfq_df = extract_rfq_lines(rfq_path)
+
+    if rfq_df is None or rfq_df.empty:
+        raise ValueError("No RFQ items were extracted.")
+
+    # 2. Load supplier prices and match them to the RFQ.
+    catalogue = load_catalogue()
+    priced_df = add_supplier_prices(rfq_df, catalogue)
+
+    # 3. Open the original template.
     workbook = load_workbook(TEMPLATE_PATH)
-    ws = workbook["Format"]
-
-    layout = expand_item_table(ws, len(rfq_df))
-
-    if layout is None:
-        last_item_row = FIRST_ITEM_ROW + len(rfq_df) - 1
-        subtotal_row = LAST_TEMPLATE_ITEM_ROW + 1
-        tax_row = subtotal_row + 1
-        packing_row = subtotal_row + 2
-        freight_row = subtotal_row + 3
-        inspection_row = subtotal_row + 4
-        total_row = subtotal_row + 5
-    else:
-        last_item_row = layout["last_item_row"]
-        subtotal_row = layout["subtotal_row"]
-        tax_row = layout["tax_row"]
-        packing_row = layout["packing_row"]
-        freight_row = layout["freight_row"]
-        inspection_row = layout["inspection_row"]
-        total_row = layout["total_row"]
-
-    # Fill only the RFQ details that are known.
-    ws["M6"] = "IEPCI/QTN/2026/DRAFT-01"
-    ws["M8"] = "KBS/RFQ/2026/0147"
-    ws["A5"] = "QUOTATION - DRAFT (PRICES TO BE VERIFIED)"
-
-    # Populate all extracted RFQ items.
-    for index, (_, item) in enumerate(rfq_df.iterrows()):
-        row = FIRST_ITEM_ROW + index
-
-        line_no = item.get("line_no", index + 1)
-        make = str(item.get("make", "") or "").strip()
-        part_code = str(item.get("part_code", "") or "").strip()
-        description = str(item.get("description", "") or "").strip()
-        code_note = str(item.get("code_note", "") or "").strip()
-        qty = item.get("qty", None)
-        unit = str(item.get("unit", "") or "").strip()
-
-        ws.cell(row, 1).value = (
-            int(line_no) if str(line_no).isdigit() else index + 1
-        )
-        ws.cell(row, 2).value = part_code or None
-
-        description_parts = []
-        if make:
-            description_parts.append(make)
-        if description:
-            description_parts.append(description)
-        if code_note:
-            description_parts.append(f"REVIEW: {code_note}")
-
-        ws.cell(row, 3).value = " — ".join(description_parts)
-        ws.cell(row, 9).value = unit
-        ws.cell(row, 10).value = int(qty) if str(qty).isdigit() else qty
-
-        # No unapproved selling price is entered.
-        unit_rate = item.get("unit_rate")
-        approved = item.get("price_approved", False)
-
-        if approved and unit_rate is not None and str(unit_rate).strip().lower() not in ("", "nan"):
-            ws.cell(row, 11).value = float(unit_rate)
-        else:
-            ws.cell(row, 11).value = None
-        ws.cell(row, 13).value = (
-            f'=IF(OR(K{row}="",J{row}=""),"",K{row}*J{row})'
-        )
-
-    # Keep labels aligned with the template's commercial section.
-    ws.cell(subtotal_row, 3).value = "Subtotal"
-    ws.cell(tax_row, 3).value = "Taxes"
-    ws.cell(packing_row, 3).value = "Packing and Forwarding"
-    ws.cell(freight_row, 3).value = "Freight and Insurance"
-    ws.cell(inspection_row, 3).value = "Inspection"
-    ws.cell(total_row, 3).value = "Total"
-
-    # Calculate totals only when rates have been entered.
-    ws.cell(subtotal_row, 13).value = (
-        f'=IF(COUNT(K{FIRST_ITEM_ROW}:K{last_item_row})=0,"",'
-        f'SUM(M{FIRST_ITEM_ROW}:M{last_item_row}))'
-    )
-
-    # The template uses 18% GST; applicability must be confirmed before issue.
-    ws.cell(tax_row, 10).value = 0.18
-    ws.cell(tax_row, 13).value = (
-        f'=IF(M{subtotal_row}="","",M{subtotal_row}*18%)'
-    )
-
-    # Packing is a direct amount; leave it blank until approved.
-    ws.cell(packing_row, 13).value = None
-
-    ws.cell(freight_row, 13).value = (
-        f'=IF(OR(K{freight_row}="",J{freight_row}=""),"",'
-        f'K{freight_row}*J{freight_row})'
-    )
-
-    ws.cell(inspection_row, 13).value = (
-        f'=IF(OR(K{inspection_row}="",J{inspection_row}=""),"",'
-        f'K{inspection_row}*J{inspection_row})'
-    )
-
-    ws.cell(total_row, 13).value = (
-        f'=IF(M{subtotal_row}="","",'
-        f'M{subtotal_row}+M{tax_row}+N(M{packing_row})'
-        f'+N(M{freight_row})+N(M{inspection_row}))'
-    )
-
-    # Keep the draft warning in the title instead of overwriting row 36.
-    # Row 36 and the following rows remain part of the quotation layout.
 
     try:
-        workbook.calculation.fullCalcOnLoad = True
-        workbook.calculation.forceFullCalc = True
-        workbook.calculation.calcMode = "auto"
-    except AttributeError:
-        pass
+        if "Format" not in workbook.sheetnames:
+            raise ValueError(
+                "The quotation template has no 'Format' worksheet."
+            )
 
-    workbook.save(output_path)
+        sheet = workbook["Format"]
+
+        # 4. Make room for every RFQ item.
+        expand_item_table(sheet, len(priced_df))
+
+        last_item_row = FIRST_ITEM_ROW + len(priced_df) - 1
+
+        # 5. Mark the output clearly as a draft.
+        sheet["A5"] = (
+            "QUOTATION - DRAFT - VERIFY PRICES, CURRENCY AND TAX"
+        )
+        sheet["M6"] = "IEPCI/QTN/2026/DRAFT-01"
+        sheet["M8"] = "KBS/RFQ/2026/0147"
+
+        # 6. Populate the item table.
+        for index, (_, item) in enumerate(priced_df.iterrows()):
+            row = FIRST_ITEM_ROW + index
+
+            part_code = get_value(item, "part_code", default="")
+            description = get_value(item, "description", default="")
+            make = get_value(item, "make", default="")
+            unit = get_value(item, "unit", default="Each")
+            quantity = get_value(
+                item, "qty", "quantity", default=None
+            )
+
+            if make and description:
+                description = f"{make} - {description}"
+
+            set_cell_value(sheet, row, COL_NUMBER, index + 1)
+            set_cell_value(sheet, row, COL_PART_CODE, part_code)
+            set_cell_value(sheet, row, COL_DESCRIPTION, description)
+            set_cell_value(sheet, row, COL_UNIT, unit)
+            set_cell_value(sheet, row, COL_QUANTITY, quantity)
+
+            status = str(
+                get_value(
+                    item, "supplier_price_status", default=""
+                )
+            ).strip()
+
+            price = get_value(item, "supplier_price_inr")
+
+            # Only populate prices for the explicitly recognised
+            # matching statuses. Missing/incomplete codes stay blank.
+            approved_statuses = {
+                "LIST PRICE FOUND - verify specs",
+                "DUPLICATE CODE - same price",
+            }
+
+            if (
+                status in approved_statuses
+                and price is not None
+                and pd.notna(price)
+            ):
+                set_cell_value(
+                    sheet, row, COL_UNIT_PRICE, float(price)
+                )
+                set_cell_value(
+                    sheet,
+                    row,
+                    COL_LINE_TOTAL,
+                    f"=J{row}*K{row}",
+                )
+            else:
+                set_cell_value(sheet, row, COL_UNIT_PRICE, None)
+                set_cell_value(sheet, row, COL_LINE_TOTAL, None)
+
+        # 7. Refresh totals formulas where template labels are recognised.
+        update_totals(sheet, FIRST_ITEM_ROW, last_item_row)
+
+        # Ask Excel to recalculate formulas when the workbook opens.
+        try:
+            workbook.calculation.fullCalcOnLoad = True
+            workbook.calculation.forceFullCalc = True
+            workbook.calculation.calcMode = "auto"
+        except AttributeError:
+            pass
+
+        workbook.save(output_path)
+
+    finally:
+        workbook.close()
+
+    print(f"Draft quotation created: {output_path}")
+    print(f"RFQ items processed: {len(priced_df)}")
+    print("Review unmatched codes and blank prices before proceeding.")
+    print("Verify GBP/INR currency, tax and commercial terms before sending.")
+
     return output_path
 
 
 if __name__ == "__main__":
-    path = generate_quotation()
-    print(f"Draft quotation created: {path}")
-    print("Unit rates and final totals have not been approved.")
+    generate_quotation()

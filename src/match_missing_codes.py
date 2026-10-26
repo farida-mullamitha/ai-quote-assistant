@@ -1,13 +1,33 @@
 import re
-
 import pandas as pd
-
 from src.extract_rfq import extract_rfq_lines
 from src.load_price_lists import load_catalogue
 
 
-# Specifications we can look for in a product description.
+def is_missing_or_incomplete(code):
+    """Identify blank codes and common placeholder codes."""
+    if code is None or pd.isna(code):
+        return True
+
+    code = str(code).strip().upper()
+
+    if not code:
+        return True
+
+    placeholders = {
+        "XX", "XXX", "TBC", "TBD", "N/A", "NA",
+        "UNKNOWN", "NOT PROVIDED", "NOT AVAILABLE",
+    }
+
+    return (
+        code in placeholders
+        or "XX" in code
+        or "TBC" in code
+    )
+
+
 def extract_specs(text):
+    """Extract basic technical specifications from a description."""
     text = str(text or "").upper()
 
     current = re.search(r"\b(\d+(?:\.\d+)?)\s*A\b", text)
@@ -21,13 +41,15 @@ def extract_specs(text):
         "draw_out": "DRAW-OUT" in text or "DRAWOUT" in text,
         "lsig": "LSIG" in text,
         "manual": "MANUAL" in text,
-        "electrical": "ELECTRICALLY OPERATED" in text
-        or "ELECTRIC OPERATION" in text,
+        "electrical": (
+            "ELECTRICALLY OPERATED" in text
+            or "ELECTRIC OPERATION" in text
+        ),
     }
 
 
 def get_text(row):
-    """Combine catalogue fields so we can search descriptions and specs."""
+    """Combine catalogue fields for searching."""
     fields = [
         "supplier",
         "source_sheet",
@@ -39,49 +61,58 @@ def get_text(row):
         "breaking_capacity",
     ]
 
-    return " ".join(
-        str(row.get(field, ""))
-        for field in fields
-        if pd.notna(row.get(field, ""))
-    ).upper()
+    values = []
+
+    for field in fields:
+        value = row.get(field)
+
+        if value is not None and not pd.isna(value):
+            values.append(str(value))
+
+    return " ".join(values).upper()
 
 
 def number_from_row(row, field, pattern):
-    """Read a number from a catalogue field, if possible."""
+    """Extract a numeric specification from a catalogue field."""
     value = row.get(field)
 
     if value is None or pd.isna(value):
         return None
 
     match = re.search(pattern, str(value).upper())
+
     return float(match.group(1)) if match else None
 
 
 def score_candidate(rfq_description, make, row):
+    """Score a possible product match and record specification conflicts."""
     candidate_text = get_text(row)
-    rfq_specs = extract_specs(rfq_description)
+    requested_specs = extract_specs(rfq_description)
+
     score = 0
     reasons = []
     conflicts = []
 
-    # Prefer the requested manufacturer.
-    supplier = str(row.get("supplier", "")).upper()
+    supplier = str(row.get("supplier", "") or "").upper()
+
     if make and make.upper() in supplier:
         score += 3
         reasons.append("manufacturer matches")
 
-    # These two RFQ lines specifically request air circuit breakers.
+    # This version has detailed matching rules for air circuit breakers.
     if "AIR CIRCUIT BREAKER" in rfq_description.upper():
-        if "AIR CIRCUIT BREAKER" in candidate_text or " ACB " in (
-            f" {candidate_text} "
-        ):
+        is_acb = (
+            "AIR CIRCUIT BREAKER" in candidate_text
+            or " ACB " in f" {candidate_text} "
+        )
+
+        if is_acb:
             score += 5
             reasons.append("air circuit breaker wording matches")
         else:
             conflicts.append("product family not confirmed")
 
-    # Compare current rating.
-    requested_a = rfq_specs["current_a"]
+    requested_a = requested_specs["current_a"]
     candidate_a = number_from_row(
         row, "rating_a", r"(\d+(?:\.\d+)?)"
     )
@@ -97,8 +128,7 @@ def score_candidate(rfq_description, make, row):
                 f"catalogue {candidate_a:g}A"
             )
 
-    # Compare pole count.
-    requested_poles = rfq_specs["poles"]
+    requested_poles = requested_specs["poles"]
     candidate_poles = number_from_row(
         row, "poles", r"\b([1-4])\b"
     )
@@ -114,8 +144,7 @@ def score_candidate(rfq_description, make, row):
                 f"catalogue {candidate_poles:g}"
             )
 
-    # Compare breaking capacity.
-    requested_ka = rfq_specs["breaking_ka"]
+    requested_ka = requested_specs["breaking_ka"]
     candidate_ka = number_from_row(
         row, "breaking_capacity", r"(\d+(?:\.\d+)?)"
     )
@@ -123,7 +152,9 @@ def score_candidate(rfq_description, make, row):
     if requested_ka is not None and candidate_ka is not None:
         if requested_ka == candidate_ka:
             score += 4
-            reasons.append(f"breaking capacity matches ({requested_ka:g}kA)")
+            reasons.append(
+                f"breaking capacity matches ({requested_ka:g}kA)"
+            )
         else:
             score -= 6
             conflicts.append(
@@ -131,23 +162,25 @@ def score_candidate(rfq_description, make, row):
                 f"catalogue {candidate_ka:g}kA"
             )
 
-    # Compare important description details.
-    for label, phrase in [
-        ("draw-out mounting", "DRAW-OUT"),
-        ("LSIG protection", "LSIG"),
-        ("manual operation", "MANUAL"),
-    ]:
+    checks = [
+        ("DRAW-OUT", "DRAWOUT", "draw-out mounting"),
+        ("LSIG", "LSIG", "LSIG protection"),
+        ("MANUAL", "MANUAL", "manual operation"),
+    ]
+
+    for phrase, alternative, label in checks:
         if phrase in rfq_description.upper():
-            if phrase in candidate_text or (
-                phrase == "DRAW-OUT" and "DRAWOUT" in candidate_text
-            ):
+            if phrase in candidate_text or alternative in candidate_text:
                 score += 2
                 reasons.append(f"{label} found")
             else:
                 conflicts.append(f"{label} not confirmed")
 
     if "ELECTRICALLY OPERATED" in rfq_description.upper():
-        if "ELECTRICALLY OPERATED" in candidate_text:
+        if (
+            "ELECTRICALLY OPERATED" in candidate_text
+            or "ELECTRIC OPERATION" in candidate_text
+        ):
             score += 2
             reasons.append("electrical operation found")
         else:
@@ -156,10 +189,8 @@ def score_candidate(rfq_description, make, row):
     return score, reasons, conflicts
 
 
-
 def find_missing_code_candidates(rfq_lines, catalogue=None):
-    """Return ranked catalogue candidates for RFQ lines with missing codes."""
-
+    """Rank possible catalogue matches for RFQ items with unusable codes."""
     if isinstance(rfq_lines, pd.DataFrame):
         rfq_lines = rfq_lines.to_dict("records")
 
@@ -171,20 +202,36 @@ def find_missing_code_candidates(rfq_lines, catalogue=None):
     else:
         catalogue_rows = catalogue
 
-    missing_lines = [
-        line for line in rfq_lines
-        if not str(line.get("part_code", "") or "").strip()
-    ]
-
     report = []
 
-    for line in missing_lines:
+    for line in rfq_lines:
+        code = line.get("part_code", "")
+
+        if not is_missing_or_incomplete(code):
+            continue
+
         description = str(line.get("description", "") or "")
         make = str(line.get("make", "") or "")
         line_no = line.get("line_no", "?")
 
-        # This prototype currently supports air circuit breakers only.
+        # Detailed candidate scoring currently supports ACB products.
         if "AIR CIRCUIT BREAKER" not in description.upper():
+            report.append({
+                "line_no": line_no,
+                "rfq_description": description,
+                "requested_make": make,
+                "rank": None,
+                "score": None,
+                "part_code": "",
+                "candidate_description": "",
+                "source_sheet": "",
+                "price": None,
+                "supporting_details": "",
+                "checks_needed": (
+                    "Product family not supported by current matching rules"
+                ),
+                "decision": "HUMAN REVIEW REQUIRED",
+            })
             continue
 
         results = []
@@ -209,7 +256,7 @@ def find_missing_code_candidates(rfq_lines, catalogue=None):
 
             results.append((score, reasons, conflicts, row))
 
-        results.sort(key=lambda item: item[0], reverse=True)
+        results.sort(key=lambda result: result[0], reverse=True)
 
         if not results:
             report.append({
@@ -220,9 +267,10 @@ def find_missing_code_candidates(rfq_lines, catalogue=None):
                 "score": None,
                 "part_code": "",
                 "candidate_description": "",
-                "price": "",
+                "source_sheet": "",
+                "price": None,
                 "supporting_details": "",
-                "checks_needed": "No candidates found in catalogue",
+                "checks_needed": "No matching candidates found in catalogue",
                 "decision": "HUMAN REVIEW REQUIRED",
             })
             continue
@@ -230,6 +278,11 @@ def find_missing_code_candidates(rfq_lines, catalogue=None):
         for rank, (score, reasons, conflicts, row) in enumerate(
             results[:5], start=1
         ):
+            price = row.get("price_inr")
+
+            if price is not None and pd.isna(price):
+                price = None
+
             report.append({
                 "line_no": line_no,
                 "rfq_description": description,
@@ -241,12 +294,13 @@ def find_missing_code_candidates(rfq_lines, catalogue=None):
                 "source_sheet": row.get(
                     "source_sheet", row.get("category", "")
                 ),
-                "price": row.get(
-                    "price_inr", row.get("price_status", "Unknown")
-                ),
+                "price": price,
                 "supporting_details": "; ".join(reasons),
-                "checks_needed": "; ".join(conflicts)
-                or "Verify full specifications",
+                "checks_needed": (
+                    "; ".join(conflicts)
+                    if conflicts
+                    else "Verify full specifications and exact product"
+                ),
                 "decision": "HUMAN REVIEW REQUIRED",
             })
 
@@ -255,18 +309,22 @@ def find_missing_code_candidates(rfq_lines, catalogue=None):
 
 def main():
     rfq_path = "data/raw/RFQ_KBS-0147.pdf"
-    rfq_lines = extract_rfq_lines(rfq_path)
 
+    rfq_lines = extract_rfq_lines(rfq_path)
     candidates = find_missing_code_candidates(rfq_lines)
 
     if not candidates:
-        print("No candidates found for missing-code RFQ lines.")
+        print("No missing or incomplete part codes found.")
         return
 
-    for candidate in candidates:
-        print(candidate)
+    report = pd.DataFrame(candidates)
+
+    output_path = "data/processed/missing_code_candidates.csv"
+    report.to_csv(output_path, index=False)
+
+    print(f"Candidate report saved to: {output_path}")
+    print(report.to_string(index=False))
 
 
 if __name__ == "__main__":
     main()
-
