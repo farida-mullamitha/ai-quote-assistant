@@ -1,123 +1,106 @@
-"""Read an RFQ file and check which of its part codes exist in the price lists.
 
-Run from the project root:
-    python src/check_rfq_codes.py data/raw/RFQ_KBS-0147.pdf
+"""Check RFQ part codes against the supplier price catalogue."""
 
-The RFQ can be a PDF, Word (.docx) or Excel (.xlsx) file. Nothing is typed
-in by hand: the lines come from extract_rfq.py, the prices from
-load_price_lists.py.
-
-This is the "coverage check": it shows how many RFQ lines a plain
-part-code lookup can answer, before any AI or fuzzy matching.
-"""
-
-import sys
+import argparse
+from pathlib import Path
 
 import pandas as pd
 
-from extract_rfq import extract_rfq_lines
-from load_price_lists import load_catalogue, make_key
+from src.extract_rfq import extract_rfq_lines
+from src.load_price_lists import load_catalogue, make_key
 
 
+def check_rfq_codes(rfq_path, catalogue=None):
+    """Report whether each RFQ part code has an exact supplier match."""
 
-def check_lines(lines: pd.DataFrame, catalogue: pd.DataFrame) -> pd.DataFrame:
+    if catalogue is None:
+        catalogue = load_catalogue()
+
+    rfq = extract_rfq_lines(str(rfq_path))
     results = []
 
-    for line in lines.itertuples():
-        base = {
-            "line": line.line_no,
-            "make": line.make,
-            "rfq_code": line.part_code,
-        }
+    for _, item in rfq.iterrows():
+        code = str(item.get("part_code", "") or "").strip()
+        make = str(item.get("make", "") or "").strip()
+        code_key = make_key(code)
 
-        # No code was supplied by the customer.
-        if not line.part_code:
-            note = f" ({line.code_note})" if line.code_note else ""
-            results.append({
-                **base,
-                "result": "HUMAN REVIEW NEEDED - MISSING CODE" + note,
-                "sheet": "",
-                "price_inr": "",
-            })
-            continue
-
-        # Find matching products for the requested supplier and code.
-        hits = catalogue[
-            (catalogue["supplier"] == line.make)
-            & (
-                catalogue["part_code_key"]
-                == make_key(line.part_code)
+        matching_rows = catalogue[
+            (
+                catalogue["supplier"].astype(str).str.casefold()
+                == make.casefold()
             )
-        ]
+            & (
+                catalogue["part_code_key"].astype(str)
+                == code_key
+            )
+        ] if code_key else catalogue.iloc[0:0]
 
-        if hits.empty:
-            results.append({
-                **base,
-                "result": "HUMAN REVIEW NEEDED - NOT FOUND",
-                "sheet": "",
-                "price_inr": "",
-            })
-            continue
-
-        # Compare all matching prices before deciding the status.
-        different_prices = (
-            hits["price_inr"].nunique(dropna=False) > 1
-        )
-
-        incomplete_code = "XX" in line.part_code.upper()
-
-        for _, row in hits.iterrows():
-            reasons = []
-
-            if len(hits) > 1:
-                if different_prices:
-                    reasons.append("PRICE CONFLICT")
-                else:
-                    reasons.append("DUPLICATE MATCH")
-
-            if incomplete_code:
-                reasons.append("INCOMPLETE CODE")
-
-            if pd.isna(row["price_inr"]):
-                reasons.append("PRICE UNAVAILABLE")
-
-            if reasons:
-                status = "HUMAN REVIEW NEEDED - " + ", ".join(reasons)
+        if not code_key:
+            status = "MISSING PART CODE"
+        elif "XX" in code.upper():
+            status = "INCOMPLETE PART CODE"
+        elif matching_rows.empty:
+            status = "CODE NOT FOUND"
+        elif matching_rows["price_inr"].dropna().empty:
+            status = "CODE FOUND, PRICE MISSING"
+        else:
+            prices = matching_rows["price_inr"].dropna().unique()
+            if len(prices) > 1:
+                status = "MULTIPLE DIFFERENT PRICES"
             else:
-                status = "MATCHED - VERIFY SPECS"
+                status = "CODE AND PRICE FOUND"
 
-            if pd.notna(row["price_inr"]):
-                price = f"{row['price_inr']:,.0f}"
-            else:
-                price = row["price_status"]
-
-            results.append({
-                **base,
-                "result": status,
-                "sheet": row["source_sheet"],
-                "price_inr": price,
-            })
+        results.append({
+            "line_no": item.get("line_no", ""),
+            "make": make,
+            "part_code": code,
+            "description": item.get("description", ""),
+            "qty": item.get("qty", ""),
+            "status": status,
+            "matched_price_inr": (
+                matching_rows["price_inr"].dropna().iloc[0]
+                if status == "CODE AND PRICE FOUND"
+                else None
+            ),
+            "source_sheet": (
+                ", ".join(
+                    matching_rows["source_sheet"]
+                    .dropna().astype(str).unique()
+                )
+                if not matching_rows.empty else ""
+            ),
+        })
 
     return pd.DataFrame(results)
 
-def main() -> None:
-    if len(sys.argv) != 2:
-        sys.exit("Usage: python src/check_rfq_codes.py <rfq file>")
 
-    lines = extract_rfq_lines(sys.argv[1])
-    report = check_lines(lines, load_catalogue())
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check RFQ codes against supplier price lists."
+    )
+    parser.add_argument(
+        "rfq",
+        nargs="?",
+        default="data/raw/RFQ_KBS-0147.pdf",
+        help="Path to the RFQ file",
+    )
+    parser.add_argument(
+        "--out",
+        default="data/processed/rfq_code_check.csv",
+        help="Path for the report CSV",
+    )
+    args = parser.parse_args()
 
-    pd.set_option("display.width", 200, "display.max_colwidth", 60)
+    report = check_rfq_codes(Path(args.rfq))
+
+    output = Path(args.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    report.to_csv(output, index=False)
+
     print(report.to_string(index=False))
-    print(f"\n{report['line'].nunique()} RFQ lines checked.")
-    print(f"{len(report)} report rows, including duplicate matches.")
-
-    review_lines = report.loc[
-        report["result"].str.startswith("HUMAN REVIEW NEEDED"),
-        "line",
-    ].nunique()
-
-    print(f"{review_lines} RFQ lines need human review.")
+    print(f"\nReport saved to: {output}")
+    print("\nStatus summary:")
+    print(report["status"].value_counts().to_string())
 
 
 if __name__ == "__main__":
